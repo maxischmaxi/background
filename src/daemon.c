@@ -179,9 +179,12 @@ static void *gen_worker(void *arg) {
         .auth_value_prefix = j->req.prov.auth_value_prefix,
     };
     reply_progress(j->req.client_fd, j->req.src_path ? "Refining image" : "Generating image");
-    j->ok = bg_imagegen(&opts, j->req.prompt, j->req.src_path, &j->res);
-    if (!j->ok) snprintf(j->err, sizeof(j->err), "image request failed (see daemon log)");
-    else reply_progress(j->req.client_fd, "Image received");
+    j->ok = bg_imagegen(&opts, j->req.prompt, j->req.src_path, &j->res, j->err, sizeof(j->err));
+    // bg_imagegen fills j->err with a parsed, human-readable reason (e.g. the
+    // provider's own error message); keep a generic fallback for the rare path
+    // that fails without one.
+    if (!j->ok && !j->err[0]) snprintf(j->err, sizeof(j->err), "image request failed (see daemon log)");
+    else if (j->ok) reply_progress(j->req.client_fd, "Image received");
 
     uint64_t one = 1;
     ssize_t wr = write(ctx->gen_evfd, &one, sizeof(one)); // wake the main loop

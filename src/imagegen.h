@@ -52,9 +52,14 @@ void bg_imagegen_global_cleanup(void);
 
 // Synchronous generate (src_path == NULL) or refine/edit (src_path != NULL).
 // Returns true on success (out filled; free with bg_imagegen_free_result),
-// false on error (and logs). Safe on a worker thread after global_init.
+// false on error (and logs). On error, writes a short human-readable reason into
+// errbuf (truncated to errcap, always NUL-terminated) — the provider's own error
+// message when the response carried one — so callers can surface it directly
+// instead of "see daemon log". Pass errbuf=NULL/errcap=0 to opt out. Safe on a
+// worker thread after global_init.
 bool bg_imagegen(const bg_gen_opts *opts, const char *prompt,
-                 const char *src_path, bg_gen_result *out);
+                 const char *src_path, bg_gen_result *out,
+                 char *errbuf, size_t errcap);
 
 void bg_imagegen_free_result(bg_gen_result *res);
 

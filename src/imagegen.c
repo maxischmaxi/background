@@ -22,14 +22,93 @@
 #include <cJSON.h>
 #include <curl/curl.h>
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+// ---------- user-facing error reporting ----------
+//
+// Each request path writes a short, human-readable reason into the caller's
+// errbuf (NULL/cap 0 = caller doesn't want one — e.g. the offline tests). The
+// daemon hands this string straight to the CLI, so it must read cleanly on its
+// own ("Incorrect API key provided …" rather than "see daemon log"). Detailed
+// dumps still go to the log via LOG_ERR.
+
+static void set_err(char *errbuf, size_t errcap, const char *fmt, ...) {
+    if (!errbuf || errcap == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(errbuf, errcap, fmt, ap);
+    va_end(ap);
+}
+
+// Pull a human-readable message out of a provider's JSON error body, covering
+// the shapes the three schemes return:
+//   OpenAI / Gemini   {"error":{"message":"…"}}   (or "error":"…")
+//   Stability         {"errors":["…"]}  or  {"message":"…","name":"…"}
+// Falls back to a trimmed single-line snippet of the raw body when the shape is
+// unknown or the body isn't JSON. Writes into dst (truncated to cap), always
+// NUL-terminated; leaves dst empty if there's nothing usable.
+static void extract_api_error(const char *body, size_t body_len, char *dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    dst[0] = '\0';
+    const char *msg = NULL;
+    cJSON *root = body ? cJSON_Parse(body) : NULL;
+    if (root) {
+        cJSON *err = cJSON_GetObjectItem(root, "error");
+        if (cJSON_IsObject(err)) {
+            cJSON *m = cJSON_GetObjectItem(err, "message");
+            if (cJSON_IsString(m)) msg = m->valuestring;
+        } else if (cJSON_IsString(err)) {
+            msg = err->valuestring;
+        }
+        if (!msg) {  // Stability / generic top-level "message"
+            cJSON *m = cJSON_GetObjectItem(root, "message");
+            if (cJSON_IsString(m)) msg = m->valuestring;
+        }
+        if (!msg) {  // Stability "errors":["…"]
+            cJSON *errs = cJSON_GetObjectItem(root, "errors");
+            cJSON *first = cJSON_IsArray(errs) ? cJSON_GetArrayItem(errs, 0) : NULL;
+            if (cJSON_IsString(first)) msg = first->valuestring;
+        }
+    }
+    if (msg && *msg) {
+        snprintf(dst, cap, "%s", msg);  // msg points into root; copy before free
+    } else if (body && body_len) {
+        // Unknown shape: copy a trimmed, single-line snippet of the raw body so
+        // the user at least sees what the provider said.
+        size_t i = 0;
+        while (i < body_len &&
+               (body[i] == ' ' || body[i] == '\n' || body[i] == '\r' || body[i] == '\t'))
+            i++;
+        size_t o = 0;
+        for (; i < body_len && o + 1 < cap; i++) {
+            char c = body[i];
+            dst[o++] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+        }
+        dst[o] = '\0';
+    }
+    if (root) cJSON_Delete(root);
+}
+
 // ---------- growable buffer for libcurl writes ----------
 
 typedef struct { char *data; size_t len, cap; } buf_t;
+
+// Compose the user-facing message for an HTTP >= 400 response into errbuf:
+// "<who> API error (HTTP <code>): <provider message>". `who` is the configured
+// provider label (falls back to the scheme name).
+static void set_http_err(char *errbuf, size_t errcap, const char *who,
+                         long http, const buf_t *resp) {
+    char detail[200];
+    extract_api_error(resp ? resp->data : NULL, resp ? resp->len : 0, detail, sizeof detail);
+    if (detail[0])
+        set_err(errbuf, errcap, "%s API error (HTTP %ld): %s", who, http, detail);
+    else
+        set_err(errbuf, errcap, "%s API error (HTTP %ld)", who, http);
+}
 
 static size_t buf_write(void *ptr, size_t size, size_t nmemb, void *userdata) {
     buf_t *b = userdata;
@@ -161,8 +240,9 @@ static struct curl_slist *append_auth(struct curl_slist *h, const bg_gen_opts *o
 
 // Run a configured request; fill *resp (caller frees resp->data) and *http.
 // Returns true if the transfer completed (any HTTP status), false on transport
-// error. Shared timeout/UA live here.
-static bool perform_request(CURL *curl, const char *label, buf_t *resp, long *http) {
+// error (in which case errbuf gets the curl reason). Shared timeout/UA live here.
+static bool perform_request(CURL *curl, const char *label, buf_t *resp, long *http,
+                            char *errbuf, size_t errcap) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, buf_write);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
@@ -170,7 +250,11 @@ static bool perform_request(CURL *curl, const char *label, buf_t *resp, long *ht
     CURLcode rc = curl_easy_perform(curl);
     *http = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http);
-    if (rc != CURLE_OK) { LOG_ERR("%s: curl: %s", label, curl_easy_strerror(rc)); return false; }
+    if (rc != CURLE_OK) {
+        LOG_ERR("%s: curl: %s", label, curl_easy_strerror(rc));
+        set_err(errbuf, errcap, "network error contacting %s: %s", label, curl_easy_strerror(rc));
+        return false;
+    }
     return true;
 }
 
@@ -183,7 +267,7 @@ static bool download_url(const char *url, bg_gen_result *out) {
     long http = 0;
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-    bool ok = perform_request(curl, "download", &resp, &http);
+    bool ok = perform_request(curl, "download", &resp, &http, NULL, 0);
     if (ok && http >= 400) { LOG_ERR("download: HTTP %ld", http); ok = false; }
     else if (ok && (!resp.data || resp.len == 0)) { LOG_ERR("download: empty body"); ok = false; }
     if (ok) {
@@ -239,12 +323,22 @@ static bool openai_parse(const char *body, bg_gen_result *out) {
     return ok;
 }
 
-static bool openai_generate(const bg_gen_opts *o, const char *prompt, bg_gen_result *out) {
+static bool openai_generate(const bg_gen_opts *o, const char *prompt, bg_gen_result *out,
+                            char *errbuf, size_t errcap) {
     char *bs = build_openai_body(o, prompt);
-    if (!bs) { LOG_ERR("openai: json build failed"); return false; }
+    if (!bs) {
+        LOG_ERR("openai: json build failed");
+        set_err(errbuf, errcap, "openai: failed to build request");
+        return false;
+    }
     char *url = join_url(o->base_url, "/images/generations");
     CURL *curl = url ? curl_easy_init() : NULL;
-    if (!curl) { free(url); free(bs); LOG_ERR("openai: curl init failed"); return false; }
+    if (!curl) {
+        free(url); free(bs);
+        LOG_ERR("openai: curl init failed");
+        set_err(errbuf, errcap, "openai: failed to initialise HTTP client");
+        return false;
+    }
 
     struct curl_slist *h = NULL;
     h = append_auth(h, o);
@@ -257,29 +351,43 @@ static bool openai_generate(const bg_gen_opts *o, const char *prompt, bg_gen_res
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(bs));
 
     buf_t resp = {0}; long http = 0;
-    bool ok = perform_request(curl, "openai", &resp, &http);
+    bool ok = perform_request(curl, "openai", &resp, &http, errbuf, errcap);
     if (ok && http >= 400) {
         LOG_ERR("openai: HTTP %ld: %.*s", http,
                 (int)(resp.len < 800 ? resp.len : 800), resp.data ? resp.data : "");
+        set_http_err(errbuf, errcap, o->provider ? o->provider : "openai", http, &resp);
         ok = false;
-    } else if (ok && !resp.data) { LOG_ERR("openai: empty response"); ok = false; }
-    else if (ok) ok = openai_parse(resp.data, out);
+    } else if (ok && !resp.data) {
+        LOG_ERR("openai: empty response");
+        set_err(errbuf, errcap, "openai: empty response from provider");
+        ok = false;
+    } else if (ok) {
+        ok = openai_parse(resp.data, out);
+        if (!ok) set_err(errbuf, errcap, "openai: response could not be decoded as an image");
+    }
 
     free(resp.data); curl_slist_free_all(h); curl_easy_cleanup(curl); free(url); free(bs);
     return ok;
 }
 
 static bool openai_edit(const bg_gen_opts *o, const char *prompt,
-                        const char *src_path, bg_gen_result *out) {
+                        const char *src_path, bg_gen_result *out,
+                        char *errbuf, size_t errcap) {
     char *url = join_url(o->base_url, "/images/edits");
     CURL *curl = url ? curl_easy_init() : NULL;
-    if (!curl) { free(url); LOG_ERR("openai: curl init failed"); return false; }
+    if (!curl) {
+        free(url);
+        LOG_ERR("openai: curl init failed");
+        set_err(errbuf, errcap, "openai: failed to initialise HTTP client");
+        return false;
+    }
 
     curl_mime *mime = curl_mime_init(curl);
     curl_mimepart *part = curl_mime_addpart(mime);
     curl_mime_name(part, "image");
     if (curl_mime_filedata(part, src_path) != CURLE_OK) {
         LOG_ERR("openai: cannot attach source image %s", src_path);
+        set_err(errbuf, errcap, "openai: cannot read source image '%s'", src_path);
         curl_mime_free(mime); curl_easy_cleanup(curl); free(url);
         return false;
     }
@@ -298,13 +406,20 @@ static bool openai_edit(const bg_gen_opts *o, const char *prompt,
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
 
     buf_t resp = {0}; long http = 0;
-    bool ok = perform_request(curl, "openai", &resp, &http);
+    bool ok = perform_request(curl, "openai", &resp, &http, errbuf, errcap);
     if (ok && http >= 400) {
         LOG_ERR("openai: HTTP %ld: %.*s", http,
                 (int)(resp.len < 800 ? resp.len : 800), resp.data ? resp.data : "");
+        set_http_err(errbuf, errcap, o->provider ? o->provider : "openai", http, &resp);
         ok = false;
-    } else if (ok && !resp.data) { LOG_ERR("openai: empty response"); ok = false; }
-    else if (ok) ok = openai_parse(resp.data, out);
+    } else if (ok && !resp.data) {
+        LOG_ERR("openai: empty response");
+        set_err(errbuf, errcap, "openai: empty response from provider");
+        ok = false;
+    } else if (ok) {
+        ok = openai_parse(resp.data, out);
+        if (!ok) set_err(errbuf, errcap, "openai: response could not be decoded as an image");
+    }
 
     free(resp.data); curl_slist_free_all(h); curl_mime_free(mime); curl_easy_cleanup(curl); free(url);
     return ok;
@@ -381,9 +496,13 @@ static bool gemini_parse(const char *body, bg_gen_result *out) {
 }
 
 static bool gemini_request(const bg_gen_opts *o, const char *prompt,
-                           const char *src_path, bg_gen_result *out) {
+                           const char *src_path, bg_gen_result *out,
+                           char *errbuf, size_t errcap) {
     char *bs = build_gemini_body(o, prompt, src_path);
-    if (!bs) return false;  // build logs on failure
+    if (!bs) {  // build logs on failure
+        set_err(errbuf, errcap, "gemini: failed to build request");
+        return false;
+    }
 
     size_t pn = strlen("/models/") + strlen(o->model) + strlen(":generateContent") + 1;
     char *mpath = malloc(pn);
@@ -393,7 +512,12 @@ static bool gemini_request(const bg_gen_opts *o, const char *prompt,
         url = join_url(o->base_url, mpath);
     }
     CURL *curl = url ? curl_easy_init() : NULL;
-    if (!curl) { free(mpath); free(url); free(bs); LOG_ERR("gemini: curl init failed"); return false; }
+    if (!curl) {
+        free(mpath); free(url); free(bs);
+        LOG_ERR("gemini: curl init failed");
+        set_err(errbuf, errcap, "gemini: failed to initialise HTTP client");
+        return false;
+    }
 
     struct curl_slist *h = NULL;
     h = append_auth(h, o);
@@ -406,13 +530,20 @@ static bool gemini_request(const bg_gen_opts *o, const char *prompt,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(bs));
 
     buf_t resp = {0}; long http = 0;
-    bool ok = perform_request(curl, "gemini", &resp, &http);
+    bool ok = perform_request(curl, "gemini", &resp, &http, errbuf, errcap);
     if (ok && http >= 400) {
         LOG_ERR("gemini: HTTP %ld: %.*s", http,
                 (int)(resp.len < 800 ? resp.len : 800), resp.data ? resp.data : "");
+        set_http_err(errbuf, errcap, o->provider ? o->provider : "gemini", http, &resp);
         ok = false;
-    } else if (ok && !resp.data) { LOG_ERR("gemini: empty response"); ok = false; }
-    else if (ok) ok = gemini_parse(resp.data, out);
+    } else if (ok && !resp.data) {
+        LOG_ERR("gemini: empty response");
+        set_err(errbuf, errcap, "gemini: empty response from provider");
+        ok = false;
+    } else if (ok) {
+        ok = gemini_parse(resp.data, out);
+        if (!ok) set_err(errbuf, errcap, "gemini: response had no inline image data");
+    }
 
     free(resp.data); curl_slist_free_all(h); curl_easy_cleanup(curl); free(url); free(mpath); free(bs);
     return ok;
@@ -429,10 +560,16 @@ static bool looks_like_aspect(const char *s) {
     return true;
 }
 
-static bool stability_generate(const bg_gen_opts *o, const char *prompt, bg_gen_result *out) {
+static bool stability_generate(const bg_gen_opts *o, const char *prompt, bg_gen_result *out,
+                               char *errbuf, size_t errcap) {
     char *url = join_url(o->base_url, "/v2beta/stable-image/generate/core");
     CURL *curl = url ? curl_easy_init() : NULL;
-    if (!curl) { free(url); LOG_ERR("stability: curl init failed"); return false; }
+    if (!curl) {
+        free(url);
+        LOG_ERR("stability: curl init failed");
+        set_err(errbuf, errcap, "stability: failed to initialise HTTP client");
+        return false;
+    }
 
     curl_mime *mime = curl_mime_init(curl);
     curl_mimepart *part;
@@ -450,13 +587,17 @@ static bool stability_generate(const bg_gen_opts *o, const char *prompt, bg_gen_
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
 
     buf_t resp = {0}; long http = 0;
-    bool ok = perform_request(curl, "stability", &resp, &http);
+    bool ok = perform_request(curl, "stability", &resp, &http, errbuf, errcap);
     if (ok && http >= 400) {
         LOG_ERR("stability: HTTP %ld: %.*s", http,
                 (int)(resp.len < 800 ? resp.len : 800), resp.data ? resp.data : "");
+        set_http_err(errbuf, errcap, o->provider ? o->provider : "stability", http, &resp);
         ok = false;
-    } else if (ok && (!resp.data || resp.len == 0)) { LOG_ERR("stability: empty response"); ok = false; }
-    else if (ok) {
+    } else if (ok && (!resp.data || resp.len == 0)) {
+        LOG_ERR("stability: empty response");
+        set_err(errbuf, errcap, "stability: empty response from provider");
+        ok = false;
+    } else if (ok) {
         out->data = (uint8_t *)resp.data;   // body IS the image
         out->len = resp.len;
         out->ext = ext_from_curl(curl);
@@ -473,23 +614,32 @@ void bg_imagegen_global_init(void)    { curl_global_init(CURL_GLOBAL_DEFAULT); }
 void bg_imagegen_global_cleanup(void) { curl_global_cleanup(); }
 
 bool bg_imagegen(const bg_gen_opts *o, const char *prompt,
-                 const char *src_path, bg_gen_result *out) {
+                 const char *src_path, bg_gen_result *out,
+                 char *errbuf, size_t errcap) {
+    if (errbuf && errcap) errbuf[0] = '\0';
     out->data = NULL; out->len = 0; out->ext = "png";
     if (!o->api_key || !*o->api_key) {
         LOG_ERR("imagegen: no API key for provider '%s'", o->provider ? o->provider : "?");
+        set_err(errbuf, errcap, "no API key configured for provider '%s'",
+                o->provider ? o->provider : "?");
         return false;
     }
     switch (o->scheme) {
     case BG_SCHEME_OPENAI:
-        return src_path ? openai_edit(o, prompt, src_path, out)
-                        : openai_generate(o, prompt, out);
+        return src_path ? openai_edit(o, prompt, src_path, out, errbuf, errcap)
+                        : openai_generate(o, prompt, out, errbuf, errcap);
     case BG_SCHEME_GEMINI:
-        return gemini_request(o, prompt, src_path, out);
+        return gemini_request(o, prompt, src_path, out, errbuf, errcap);
     case BG_SCHEME_STABILITY:
-        if (src_path) { LOG_ERR("stability: refine/edit not supported (needs an inpaint mask)"); return false; }
-        return stability_generate(o, prompt, out);
+        if (src_path) {
+            LOG_ERR("stability: refine/edit not supported (needs an inpaint mask)");
+            set_err(errbuf, errcap, "stability: refine/edit not supported (needs an inpaint mask)");
+            return false;
+        }
+        return stability_generate(o, prompt, out, errbuf, errcap);
     }
     LOG_ERR("imagegen: unknown scheme");
+    set_err(errbuf, errcap, "internal error: unknown provider scheme");
     return false;
 }
 

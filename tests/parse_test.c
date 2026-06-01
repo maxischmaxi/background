@@ -90,6 +90,49 @@ int main(void) {
         printf("ok: looks_like_aspect\n");
     }
 
+    // --- extract_api_error: pulls the provider's message out of each shape ---
+    {
+        char d[200];
+        // OpenAI / Gemini: error.message (e.g. an expired/invalid key)
+        const char *openai = "{\"error\":{\"message\":\"Incorrect API key provided\",\"code\":\"invalid_api_key\"}}";
+        extract_api_error(openai, strlen(openai), d, sizeof d);
+        assert(strcmp(d, "Incorrect API key provided") == 0);
+        // error as a bare string
+        const char *bare = "{\"error\":\"unauthorized\"}";
+        extract_api_error(bare, strlen(bare), d, sizeof d);
+        assert(strcmp(d, "unauthorized") == 0);
+        // Stability: errors[] array
+        const char *stab = "{\"errors\":[\"invalid prompt\"],\"name\":\"bad_request\"}";
+        extract_api_error(stab, strlen(stab), d, sizeof d);
+        assert(strcmp(d, "invalid prompt") == 0);
+        // top-level message
+        const char *msg = "{\"message\":\"rate limit exceeded\"}";
+        extract_api_error(msg, strlen(msg), d, sizeof d);
+        assert(strcmp(d, "rate limit exceeded") == 0);
+        // non-JSON / unknown shape: trimmed single-line snippet of the raw body
+        const char *raw = "  <html>nginx 502\n bad gateway</html>";
+        extract_api_error(raw, strlen(raw), d, sizeof d);
+        assert(strcmp(d, "<html>nginx 502  bad gateway</html>") == 0);
+        // empty / NULL bodies leave dst empty
+        extract_api_error(NULL, 0, d, sizeof d);
+        assert(d[0] == '\0');
+        printf("ok: extract_api_error\n");
+    }
+
+    // --- set_http_err: composes "<who> API error (HTTP n): <message>" ---
+    {
+        char e[256];
+        buf_t resp = { .data = "{\"error\":{\"message\":\"Incorrect API key provided\"}}" };
+        resp.len = strlen(resp.data);
+        set_http_err(e, sizeof e, "openai", 401, &resp);
+        assert(strcmp(e, "openai API error (HTTP 401): Incorrect API key provided") == 0);
+        // no parseable detail → just the status line
+        buf_t empty = { .data = NULL, .len = 0 };
+        set_http_err(e, sizeof e, "stability", 500, &empty);
+        assert(strcmp(e, "stability API error (HTTP 500)") == 0);
+        printf("ok: set_http_err\n");
+    }
+
     printf("ALL IMAGEGEN TESTS PASSED\n");
     return 0;
 }
